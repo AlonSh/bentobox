@@ -15,13 +15,16 @@ tunnel_socket = pytun.TunTapDevice("tun0")
 # tunnel_socket.netmask = '255.255.255.0'
 # tunnel_socket.mtu = 1472
 
-print(os.system('ifconfig'))
-
 
 def packet_callback(p: Packet):
     if 'ICMP' in p and p.sniffed_on == 'eth0':
         print("Forwarding TCP message!")
+        print(p['ICMP'].payload)
+        print(p['ICMP'].payload.load)
         inner_ip_packet = IP(p['ICMP'].payload.load)
+        print(bytes(inner_ip_packet))
+        print(inner_ip_packet['IP'].dst)
+
         # ls(inner_ip_packet)
         if 'TCP' not in inner_ip_packet:
             print('inner is not TCP')
@@ -29,9 +32,8 @@ def packet_callback(p: Packet):
 
         CLIENT_INNER_IP_TO_INTERNET_IP[inner_ip_packet.src] = p['IP'].src
 
-        print(bytes(inner_ip_packet))
         # wrapped_ether = Ether() / inner_ip_packet
-        tunnel_socket.write(bytes(inner_ip_packet))
+        tunnel_socket.write(bytes(inner_ip_packet)[:4] + bytes(inner_ip_packet))
 
         # ls(wrapped_ether)
         # sendp(wrapped_ether, iface='tun0')
