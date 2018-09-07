@@ -1,7 +1,8 @@
 extern crate pnet;
 extern crate tun;
+
 use pnet::datalink::Channel::Ethernet;
-use pnet::datalink::{self, NetworkInterface};
+use pnet::datalink::{self, NetworkInterface, DataLinkReceiver};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
