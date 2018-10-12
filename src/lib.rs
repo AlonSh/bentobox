@@ -9,7 +9,7 @@ extern crate tun;
 use failure::Error;
 
 use pnet::datalink::Channel::Ethernet;
-use pnet::datalink::{self, DataLinkReceiver, NetworkInterface};
+use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
@@ -28,98 +28,149 @@ pub struct IcmpTunnel {
     // The TUN device used to send packets.
     dev: Device,
     operation_mode: OperationMode,
+    raw_sender: Box<DataLinkSender>,
+    raw_receiver: Box<DataLinkReceiver>,
+    tun_sender: Box<DataLinkSender>,
+    tun_receiver: Box<DataLinkReceiver>,
 }
 
 impl IcmpTunnel {
-    pub fn client<S: AsRef<str>>(
-        tunnel_iface_name: S,
+    fn get_interface<T: AsRef<str>>(name: T) -> Result<NetworkInterface, Error> {
+        Ok(datalink::interfaces()
+            .into_iter()
+            .filter(|iface| iface.name == name.as_ref())
+            .next()
+            .ok_or(format_err!("{} not found", name.as_ref()))?)
+    }
+
+    fn setup_tunnel_device<T: AsRef<str>>(name: T, address: Ipv4Addr) -> Result<Device, Error> {
+        let mut config = tun::Configuration::default();
+        config
+            .name(name.as_ref())
+            .address(address)
+            // We only support using the device on /24 netmask
+            .netmask((255, 255, 255, 0))
+            .mtu(1472)
+            .up();
+
+        let mut dev = tun::create(&config).ok().ok_or(format_err!(
+            "Failed to create tunnel device {:?}",
+            name.as_ref()
+        ))?;
+
+        info!(
+            "Tunnel {:?} was set up with config {:?}",
+            name.as_ref(),
+            &config
+        );
+
+        Ok(dev)
+    }
+
+    fn setup_tunnel(
+        real_iface: &NetworkInterface,
+        tunnel_iface: &NetworkInterface,
+    ) -> Result<(
+        (Box<DataLinkSender>, Box<DataLinkReceiver>),
+        (Box<DataLinkSender>, Box<DataLinkReceiver>),
+    ), Error> {
+        // Create a new channel over our outgoing interface.
+        let (mut raw_sender, mut raw_receiver) =
+            match datalink::channel(real_iface, Default::default()) {
+                Ok(Ethernet(tx, rx)) => (tx, rx),
+                Ok(_) => return Err(format_err!("Unhandled channel type")),
+                Err(e) => {
+                    return Err(format_err!(
+                        "An error occurred when creating the datalink channel: {}",
+                        e
+                    ))
+                }
+            };
+
+        let (mut tun_sender, mut tun_receiver) =
+            match datalink::channel(tunnel_iface, Default::default()) {
+                Ok(Ethernet(tx, rx)) => (tx, rx),
+                Ok(_) => return Err(format_err!("Unhandled channel type")),
+                Err(e) => {
+                    return Err(format_err!(
+                        "An error occurred when creating the datalink channel: {}",
+                        e
+                    ))
+                }
+            };
+
+        Ok(((raw_sender, raw_receiver), (tun_sender, tun_receiver)))
+    }
+
+    pub fn client<T: AsRef<str>, I: AsRef<str>>(
+        real_iface_name: I,
+        tunnel_iface_name: T,
         server_address: &Ipv4Addr,
     ) -> Result<IcmpTunnel, Error> {
-        let mut config = tun::Configuration::default();
-        config
-            .name(tunnel_iface_name.as_ref())
-            .address((10, 0, 1, 2))
-            // We only support using the device on /24 netmask
-            .netmask((255, 255, 255, 0))
-            .mtu(1472)
-            .up();
+        let tunnel =
+            IcmpTunnel::setup_tunnel_device(&tunnel_iface_name, Ipv4Addr::new(10, 0, 2, 1))?;
+        let raw_interface = IcmpTunnel::get_interface(&real_iface_name)?;
+        let tunnel_interface = IcmpTunnel::get_interface(&tunnel_iface_name)?;
 
-        let mut dev = tun::create(&config).ok().ok_or(format_err!(
-            "Failed to create tunnel device {:?}",
-            tunnel_iface_name.as_ref()
-        ))?;
-
-        info!(
-            "Tunnel {:?} was set up with config {:?}",
-            tunnel_iface_name.as_ref(),
-            &config
-        );
+        let ((raw_sender, raw_receiver), (tun_sender, tun_receiver)) =
+            IcmpTunnel::setup_tunnel(&raw_interface, &tunnel_interface)?;
 
         Ok(IcmpTunnel {
-            dev,
+            dev: tunnel,
             operation_mode: OperationMode::Client(server_address.clone()),
+            raw_sender,
+            raw_receiver,
+            tun_sender,
+            tun_receiver,
         })
     }
 
-    pub fn server<S: AsRef<str>>(tunnel_iface_name: S) -> Result<IcmpTunnel, Error> {
-        let mut config = tun::Configuration::default();
-        config
-            .name(tunnel_iface_name.as_ref())
-            .address((10, 0, 1, 1))
-            // We only support using the device on /24 netmask
-            .netmask((255, 255, 255, 0))
-            .mtu(1472)
-            .up();
+    pub fn server<T: AsRef<str>, I: AsRef<str>>(
+        real_iface_name: I,
+        tunnel_iface_name: T,
+    ) -> Result<IcmpTunnel, Error> {
+        let tunnel =
+            IcmpTunnel::setup_tunnel_device(&tunnel_iface_name, Ipv4Addr::new(10, 0, 1, 1))?;
+        let raw_interface = IcmpTunnel::get_interface(&real_iface_name)?;
+        let tunnel_interface = IcmpTunnel::get_interface(&tunnel_iface_name)?;
 
-        let mut dev = tun::create(&config).ok().ok_or(format_err!(
-            "Failed to create tunnel device {:?}",
-            tunnel_iface_name.as_ref()
-        ))?;
-
-        info!(
-            "Tunnel {:?} was set up with config {:?}",
-            tunnel_iface_name.as_ref(),
-            &config
-        );
+        let ((raw_sender, raw_receiver), (tun_sender, tun_receiver)) =
+            IcmpTunnel::setup_tunnel(&raw_interface, &tunnel_interface)?;
 
         Ok(IcmpTunnel {
-            dev,
+            dev: tunnel,
             operation_mode: OperationMode::Server,
+            raw_sender,
+            raw_receiver,
+            tun_sender,
+            tun_receiver,
         })
     }
 
-    pub fn listen_on<S: AsRef<str>>(&mut self, iface_name: S) -> Result<(), Error> {
-        let interfaces = datalink::interfaces();
-        let interface = interfaces
-            .into_iter()
-            .filter(|iface| iface.name == iface_name.as_ref())
-            .next()
-            .ok_or(format_err!("{} not found", iface_name.as_ref()))?;
+    /// Starts the operation of the tunnel.
+    /// If we are serving as a client, this will wrap outgoing traffic as ICMP.
+    pub fn start<S: AsRef<str>>(&mut self, iface_name: S) -> Result<(), Error> {
+        let raw_interface = IcmpTunnel::get_interface(iface_name)?;
 
-        // Create a new channel, dealing with layer 2 packets
-        let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
-            Ok(Ethernet(tx, rx)) => (tx, rx),
-            Ok(_) => panic!("Unhandled channel type"),
-            Err(e) => panic!(
-                "An error occurred when creating the datalink channel: {}",
-                e
-            ),
-        };
-
-        loop {
-            match rx.next() {
-                Ok(packet) => {
-                    let packet = EthernetPacket::new(packet).unwrap();
-                    self.handle_ethernet_frame(&interface, &packet);
-                }
-                Err(e) => {
-                    // If an error occurs, we can handle it here
-                    panic!("An error occurred while reading: {}", e);
+        match self.operation_mode {
+            OperationMode::Client(server_addr) => {
+                loop {
+                    // When we are running as a client, our "raw_receiver" channel will be the outgoing direction.
+                    // We only look for incoming ICMPReplay packets, and we decode them and write to the tunnel.
+                    match self.raw_receiver.next() {
+                        Ok(packet) => {
+                            let packet = EthernetPacket::new(packet).unwrap();
+                            self.handle_ethernet_frame(&raw_interface, &packet);
+                        }
+                        Err(e) => {
+                            // If an error occurs, we can handle it here
+                            panic!("An error occurred while reading: {}", e);
+                        }
+                    }
                 }
             }
-        }
-        // The code will never reach here.
-        Ok(())
+            _ => unimplemented!(),
+        };
     }
 
     fn handle_icmp_packet(
@@ -156,13 +207,17 @@ impl IcmpTunnel {
                         echo_request_packet.get_identifier()
                     );
 
+                    //                    let data = &icmp_packet.payload()[4..];
                     let data = &icmp_packet.payload()[4..];
                     let underlying = Ipv4Packet::new(data).expect("Malformed payload");
 
-                    debug!("{:?}", underlying);
-                    self.dev
-                        .write(underlying.packet())
-                        .expect("Failed to write");
+                    match self.dev.write(underlying.packet()) {
+                        Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
+                        Err(e) => error!(
+                            "Failed to write to tunnel device! Error - {:?}, data {:#?}",
+                            e, underlying
+                        ),
+                    };
                 }
                 _ => debug!(
                     "[{}]: ICMP packet {} -> {} (type={:?})",

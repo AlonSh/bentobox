@@ -104,7 +104,7 @@ fn main() {
 
             info!("Starting to listen for packets.");
             // Run server.
-            tunnel.listen_on(iface).expect("Something bad happened");
+            tunnel.start(iface).expect("Something bad happened");
         }
         _ => unimplemented!(),
     }
