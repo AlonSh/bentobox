@@ -94,7 +94,7 @@ impl IcmpTunnel {
             .into_iter()
             .filter(|iface| iface.name == iface_name.as_ref())
             .next()
-            .ok_or(format_err!("eth0 not found"))?;
+            .ok_or(format_err!("{} not found", iface_name.as_ref()))?;
 
         // Create a new channel, dealing with layer 2 packets
         let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
