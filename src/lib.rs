@@ -38,7 +38,7 @@ impl IcmpTunnel {
         let mut config = tun::Configuration::default();
         config
             .name(tunnel_iface_name.as_ref())
-            .address((10, 0, 1, 1))
+            .address((10, 0, 1, 2))
             // We only support using the device on /24 netmask
             .netmask((255, 255, 255, 0))
             .mtu(1472)
@@ -49,7 +49,7 @@ impl IcmpTunnel {
             tunnel_iface_name.as_ref()
         ))?;
 
-        debug!(
+        info!(
             "Tunnel {:?} was set up with config {:?}",
             tunnel_iface_name.as_ref(),
             &config
@@ -76,7 +76,7 @@ impl IcmpTunnel {
             tunnel_iface_name.as_ref()
         ))?;
 
-        debug!(
+        info!(
             "Tunnel {:?} was set up with config {:?}",
             tunnel_iface_name.as_ref(),
             &config
@@ -135,7 +135,7 @@ impl IcmpTunnel {
                 IcmpTypes::EchoReply => {
                     let echo_reply_packet =
                         echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
-                    println!(
+                    info!(
                         "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
                         interface_name,
                         source,
@@ -147,7 +147,7 @@ impl IcmpTunnel {
                 IcmpTypes::EchoRequest => {
                     let echo_request_packet =
                         echo_request::EchoRequestPacket::new(icmp_packet.payload()).unwrap();
-                    println!(
+                    info!(
                         "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
                         interface_name,
                         source,
@@ -159,12 +159,12 @@ impl IcmpTunnel {
                     let data = &icmp_packet.payload()[4..];
                     let underlying = Ipv4Packet::new(data).expect("Malformed payload");
 
-                    println!("{:?}", underlying);
+                    debug!("{:?}", underlying);
                     self.dev
                         .write(underlying.packet())
                         .expect("Failed to write");
                 }
-                _ => println!(
+                _ => debug!(
                     "[{}]: ICMP packet {} -> {} (type={:?})",
                     interface_name,
                     source,
@@ -173,7 +173,7 @@ impl IcmpTunnel {
                 ),
             }
         } else {
-            println!("[{}]: Malformed ICMP Packet", interface_name);
+            error!("[{}]: Malformed ICMP Packet", interface_name);
         }
     }
 
