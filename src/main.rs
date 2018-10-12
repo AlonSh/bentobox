@@ -13,8 +13,12 @@ use failure::Error;
 use bentobox::IcmpTunnel;
 use clap::{App, Arg, SubCommand};
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command};
+
+const IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+const ICMP_ECHO_IGNORE_ALL: &str = "/proc/sys/net/ipv4/icmp_echo_ignore_all";
 
 fn is_running_as_root() -> bool {
     unsafe { libc::setuid(0) == 0 }
@@ -22,12 +26,26 @@ fn is_running_as_root() -> bool {
 
 fn setup_server_machine() -> Result<(), Error> {
     info!("Preventing the kernel to reply to any ICMP pings");
-    let mut icmp_echo_ignore_all = File::open("/proc/sys/net/ipv4/icmp_echo_ignore_all")?;
-    icmp_echo_ignore_all.write(b"1")?;
+    match OpenOptions::new().write(true).open(ICMP_ECHO_IGNORE_ALL) {
+        Ok(mut f) => f.write_all(String::from("1\n").as_bytes()),
+        Err(e) => {
+            return Err(format_err!(
+                "Unable to set icmp_echo_ignore_all, error - {}",
+                e
+            ))
+        }
+    }?;
 
     info!("Enabling IP forwarding");
-    let mut ip_forward = File::open("/proc/sys/net/ipv4/ip_forward")?;
-    ip_forward.write(b"1")?;
+    match OpenOptions::new().write(true).open(IPV4_FORWARD) {
+        Ok(mut f) => f.write_all(String::from("1\n").as_bytes()),
+        Err(e) => {
+            return Err(format_err!(
+                "Unable to enable IP forwarding, error - {}",
+                e
+            ))
+        }
+    }?;
 
     info!("Adding an iptables rule to masquerade for 10.0.0.0/8");
     Command::new("iptables")
@@ -87,7 +105,7 @@ fn main() {
             info!("Starting to listen for packets.");
             // Run server.
             tunnel.listen_on(iface).expect("Something bad happened");
-        },
-        _ => unimplemented!()
+        }
+        _ => unimplemented!(),
     }
 }
