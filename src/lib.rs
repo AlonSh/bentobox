@@ -184,40 +184,61 @@ impl IcmpTunnel {
         if let Some(icmp_packet) = icmp_packet {
             match icmp_packet.get_icmp_type() {
                 IcmpTypes::EchoReply => {
-                    let echo_reply_packet =
-                        echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
-                    info!(
-                        "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
-                        interface_name,
-                        source,
-                        destination,
-                        echo_reply_packet.get_sequence_number(),
-                        echo_reply_packet.get_identifier()
-                    );
+                    match self.operation_mode {
+                        OperationMode::Client(_) => {
+                            let echo_reply_packet =
+                                echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
+                            info!(
+                                "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
+                                interface_name,
+                                source,
+                                destination,
+                                echo_reply_packet.get_sequence_number(),
+                                echo_reply_packet.get_identifier()
+                            );
+                            let data = &icmp_packet.payload()[4..];
+                            let underlying = Ipv4Packet::new(data).expect("Malformed payload");
+
+                            match self.dev.write(underlying.packet()) {
+                                Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
+                                Err(e) => error!(
+                                    "Failed to write to tunnel device! Error - {:?}, data {:#?}",
+                                    e, underlying
+                                ),
+                            };
+                        }
+
+                        _ => {}
+                    }
                 }
                 IcmpTypes::EchoRequest => {
-                    let echo_request_packet =
-                        echo_request::EchoRequestPacket::new(icmp_packet.payload()).unwrap();
-                    info!(
-                        "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
-                        interface_name,
-                        source,
-                        destination,
-                        echo_request_packet.get_sequence_number(),
-                        echo_request_packet.get_identifier()
-                    );
+                    match self.operation_mode {
+                        OperationMode::Server => {
+                            let echo_request_packet =
+                                echo_request::EchoRequestPacket::new(icmp_packet.payload()).unwrap();
+                            info!(
+                                "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
+                                interface_name,
+                                source,
+                                destination,
+                                echo_request_packet.get_sequence_number(),
+                                echo_request_packet.get_identifier()
+                            );
 
-                    //                    let data = &icmp_packet.payload()[4..];
-                    let data = &icmp_packet.payload()[4..];
-                    let underlying = Ipv4Packet::new(data).expect("Malformed payload");
+                            //                    let data = &icmp_packet.payload()[4..];
+                            let data = &icmp_packet.payload()[4..];
+                            let underlying = Ipv4Packet::new(data).expect("Malformed payload");
 
-                    match self.dev.write(underlying.packet()) {
-                        Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
-                        Err(e) => error!(
-                            "Failed to write to tunnel device! Error - {:?}, data {:#?}",
-                            e, underlying
-                        ),
-                    };
+                            match self.dev.write(underlying.packet()) {
+                                Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
+                                Err(e) => error!(
+                                    "Failed to write to tunnel device! Error - {:?}, data {:#?}",
+                                    e, underlying
+                                ),
+                            };
+                        }
+                        _ => {}
+                    }
                 }
                 _ => debug!(
                     "[{}]: ICMP packet {} -> {} (type={:?})",
