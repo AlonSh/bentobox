@@ -235,7 +235,3 @@ impl IcmpTunnel {
         }
     }
 }
-
-fn main() {
-    unimplemented!();
-}

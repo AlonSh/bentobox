@@ -76,6 +76,7 @@ fn main() {
     // Setup server
     if let Some(ref matches) = matches.subcommand_matches("server") {
         info!("Running as server.");
+        setup_server_machine();
 
         let iface = matches.value_of("iface").expect("A required argument");
         info!("Setting up tunnel interface 'tun0'");
@@ -83,6 +84,6 @@ fn main() {
 
         info!("Starting to listen for packets.");
         // Run server.
-        tunnel.listen_on(iface);
+        tunnel.listen_on(iface).expect("Something bad happened");
     }
 }
