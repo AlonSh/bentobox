@@ -1,8 +1,12 @@
 [package]
-name = "bento-rs"
+name = "bentobox"
 version = "0.1.0"
 authors = ["Omer Ben-Amram <omerbenamram@gmail.com>"]
 
 [dependencies]
 pnet = "*"
 tun = "*"
+log = "*"
+failure = "*"
+clap = "*"
+libc = "*"

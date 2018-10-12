@@ -1,113 +1,88 @@
-extern crate pnet;
-extern crate tun;
+#[macro_use]
+extern crate failure;
+#[macro_use]
+extern crate log;
 
-use pnet::datalink::Channel::Ethernet;
-use pnet::datalink::{self, NetworkInterface, DataLinkReceiver};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
-use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
-use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::Packet;
+extern crate bentobox;
+extern crate clap;
+extern crate libc;
+
+use failure::Error;
+
+use bentobox::IcmpTunnel;
+use clap::{App, Arg, SubCommand};
+use std::fs::File;
 use std::io::Write;
-use std::net::IpAddr;
+use std::process::Command;
+
+fn is_running_as_root() -> bool {
+    unsafe { libc::setuid(0) == 0 }
+}
+
+fn setup_server_machine() -> Result<(), Error> {
+    info!("Preventing the kernel to reply to any ICMP pings");
+    let mut icmp_echo_ignore_all = File::open("/proc/sys/net/ipv4/icmp_echo_ignore_all")?;
+    icmp_echo_ignore_all.write(b"1")?;
+
+    info!("Enabling IP forwarding");
+    let mut ip_forward = File::open("/proc/sys/net/ipv4/ip_forward")?;
+    ip_forward.write(b"1")?;
+
+    info!("Adding an iptables rule to masquerade for 10.0.0.0/8");
+    Command::new("iptables")
+        .args(&[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            "10.0.0.0/8",
+            "-j",
+            "MASQUERADE",
+        ])
+        .spawn()?;
+
+    Ok(())
+}
 
 fn main() {
-    let mut config = tun::Configuration::default();
-    config
-        .name("tun0")
-        .address((10, 0, 1, 1))
-        .netmask((255, 255, 255, 0))
-        .mtu(1472)
-        .up();
+    let matches = {
+        let client_subcommand = SubCommand::with_name("client").arg(
+            Arg::with_name("server-ip")
+                .takes_value(true)
+                .required(true)
+                .help("IP address of the relay server"),
+        );
 
-    let mut dev = tun::create(&config).unwrap();
+        let app = App::new("Bentobox")
+            .version("2018-10")
+            .arg(
+                Arg::with_name("iface")
+                    .takes_value(true)
+                    .required(true)
+                    .help("The interface to send packets on."),
+            )
+            .subcommand(SubCommand::with_name("server"))
+            .subcommand(client_subcommand);
 
-    // Find the network interface with the provided name
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .filter(|iface| iface.name == "eth0")
-        .next()
-        .expect("eth0 not found");
-
-    // Create a new channel, dealing with layer 2 packets
-    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!(
-            "An error occurred when creating the datalink channel: {}",
-            e
-        ),
+        app.get_matches()
     };
 
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                let packet = EthernetPacket::new(packet).unwrap();
-                match packet.get_ethertype() {
-                    EtherTypes::Ipv4 => {
-                        let ipv4 = Ipv4Packet::new(packet.payload()).unwrap();
-                        match ipv4.get_next_level_protocol() {
-                            IpNextHeaderProtocols::Icmp => {
-                                let icmp_packet = IcmpPacket::new(ipv4.payload());
-                                if let Some(icmp_packet) = icmp_packet {
-                                    match icmp_packet.get_icmp_type() {
-                                        IcmpTypes::EchoReply => {
-                                            let echo_reply_packet =
-                                                echo_reply::EchoReplyPacket::new(
-                                                    icmp_packet.payload(),
-                                                ).unwrap();
-                                            println!(
-                                                "ICMP echo reply (seq={:?}, id={:?})",
-                                                echo_reply_packet.get_sequence_number(),
-                                                echo_reply_packet.get_identifier()
-                                            );
-                                        }
-                                        IcmpTypes::EchoRequest => {
-                                            let echo_request_packet =
-                                                echo_request::EchoRequestPacket::new(
-                                                    icmp_packet.payload(),
-                                                ).unwrap();
-                                            println!(
-                                                "ICMP echo request (seq={:?}, id={:?})",
-                                                echo_request_packet.get_sequence_number(),
-                                                echo_request_packet.get_identifier()
-                                            );
-
-                                            let data = &icmp_packet.payload()[4..];
-                                            let underlying =
-                                                Ipv4Packet::new(data).expect("Malformed payload");
-
-                                            println!("{:?}", underlying);
-                                            dev.write(underlying.packet())
-                                                .expect("Failed to write");
-                                        }
-                                        _ => println!(
-                                            "ICMP packet (type={:?})",
-                                            icmp_packet.get_icmp_type()
-                                        ),
-                                    }
-                                } else {
-                                    println!("Malformed ICMP Packet");
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => println!(
-                        "Unknown packet: {} > {}; ethertype: {:?} length: {}",
-                        packet.get_source(),
-                        packet.get_destination(),
-                        packet.get_ethertype(),
-                        packet.packet().len()
-                    ),
-                }
-            }
-            Err(e) => {
-                // If an error occurs, we can handle it here
-                panic!("An error occurred while reading: {}", e);
-            }
-        }
+    if !is_running_as_root() {
+        error!("bentobox needs to run as root.");
+        ::std::process::exit(-1);
     }
-    println!("{:?}", config);
+
+    // Setup server
+    if let Some(ref matches) = matches.subcommand_matches("server") {
+        info!("Running as server.");
+
+        let iface = matches.value_of("iface").expect("A required argument");
+        info!("Setting up tunnel interface 'tun0'");
+        let mut tunnel = IcmpTunnel::server("tun0").expect("Failed to create tunnel");
+
+        info!("Starting to listen for packets.");
+        // Run server.
+        tunnel.listen_on(iface);
+    }
 }
