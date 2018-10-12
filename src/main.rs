@@ -93,12 +93,12 @@ fn main() {
         ::std::process::exit(-1);
     }
 
+    let iface = matches.value_of("iface").expect("A required argument");
     match matches.subcommand() {
         ("server", Some(matches)) => {
             info!("Running as server.");
             setup_server_machine().expect("Failed to set up server");
 
-            let iface = matches.value_of("iface").expect("A required argument");
             info!("Setting up tunnel interface 'tun0'");
             let mut tunnel = IcmpTunnel::server("tun0").expect("Failed to create tunnel");
 
