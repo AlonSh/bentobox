@@ -15,6 +15,7 @@ use clap::{App, Arg, SubCommand};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::process::Command;
 
@@ -68,7 +69,7 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
         .args(&[
             "add",
             "-host",
-            format!("{}", server),
+            &format!("{}", &server),
             "gw",
             "255.255.255.0",
             "dev",
@@ -129,12 +130,21 @@ fn main() {
         }
         ("client", Some(matches)) => {
             info!("Running as client.");
-            let server_ip = matches.value_of("server-ip").expect("A required argument");
+            let server_ip_str = matches.value_of("server-ip").expect("A required argument");
+            let server_ip: IpAddr = server_ip_str
+                .parse()
+                .expect(&format!("{} is not a valid ip", &server_ip_str));
+
+            let server_addr_ipv4 = match server_ip {
+                IpAddr::V4(addr) => addr,
+                IpAddr::V6(addr) => panic!("Ipv6 addresses are not supported"),
+            };
+
             info!("Setting up tunnel interface 'tun0'");
-            let mut tunnel = IcmpTunnel::client(iface, "tun0", server_ip.parse())
+            let mut tunnel = IcmpTunnel::client(iface, "tun0", &server_addr_ipv4)
                 .expect("Failed to create tunnel");
 
-            setup_client_machine(server_ip.parse(), iface).expect("Failed to set up client");
+            setup_client_machine(&server_addr_ipv4, iface).expect("Failed to set up client");
 
             tunnel.start(iface).expect("Something bad happened")
         }
