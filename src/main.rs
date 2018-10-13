@@ -15,7 +15,7 @@ use clap::{App, Arg, SubCommand};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::process::{Command};
+use std::process::Command;
 
 const IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const ICMP_ECHO_IGNORE_ALL: &str = "/proc/sys/net/ipv4/icmp_echo_ignore_all";
@@ -39,12 +39,7 @@ fn setup_server_machine() -> Result<(), Error> {
     info!("Enabling IP forwarding");
     match OpenOptions::new().write(true).open(IPV4_FORWARD) {
         Ok(mut f) => f.write_all(String::from("1\n").as_bytes()),
-        Err(e) => {
-            return Err(format_err!(
-                "Unable to enable IP forwarding, error - {}",
-                e
-            ))
-        }
+        Err(e) => return Err(format_err!("Unable to enable IP forwarding, error - {}", e)),
     }?;
 
     info!("Adding an iptables rule to masquerade for 10.0.0.0/8");

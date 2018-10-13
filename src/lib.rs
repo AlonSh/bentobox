@@ -10,11 +10,16 @@ use failure::Error;
 
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
+use pnet::transport::{self, IcmpTransportChannelIterator, TransportReceiver, TransportSender};
+
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
+use pnet::transport::TransportChannelType::Layer4;
+use pnet::transport::TransportProtocol::Ipv4;
+use std::cell::RefCell;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use tun::platform::Device;
@@ -28,10 +33,10 @@ pub struct IcmpTunnel {
     // The TUN device used to send packets.
     dev: Device,
     operation_mode: OperationMode,
-    raw_sender: Box<DataLinkSender>,
-    raw_receiver: Box<DataLinkReceiver>,
-    tun_sender: Box<DataLinkSender>,
-    tun_receiver: Box<DataLinkReceiver>,
+    raw_sender: RefCell<Box<DataLinkSender>>,
+    raw_receiver: RefCell<Box<DataLinkReceiver>>,
+    tun_sender: RefCell<Box<DataLinkSender>>,
+    tun_receiver: RefCell<Box<DataLinkReceiver>>,
 }
 
 impl IcmpTunnel {
@@ -70,22 +75,27 @@ impl IcmpTunnel {
     fn setup_tunnel(
         real_iface: &NetworkInterface,
         tunnel_iface: &NetworkInterface,
-    ) -> Result<(
-        (Box<DataLinkSender>, Box<DataLinkReceiver>),
-        (Box<DataLinkSender>, Box<DataLinkReceiver>),
-    ), Error> {
+    ) -> Result<
+        (
+            (Box<TransportSender>, Box<TransportReceiver>),
+            (Box<DataLinkSender>, Box<DataLinkReceiver>),
+        ),
+        Error,
+    > {
+        let icmp_proto = Layer4(Ipv4(IpNextHeaderProtocols::Icmp));
+
         // Create a new channel over our outgoing interface.
-        let (mut raw_sender, mut raw_receiver) =
-            match datalink::channel(real_iface, Default::default()) {
-                Ok(Ethernet(tx, rx)) => (tx, rx),
-                Ok(_) => return Err(format_err!("Unhandled channel type")),
-                Err(e) => {
-                    return Err(format_err!(
-                        "An error occurred when creating the datalink channel: {}",
+        let (mut raw_sender, mut raw_receiver) = match transport::channel(real_iface, icmp_proto) {
+            Ok(Ethernet(tx, rx)) => (tx, rx),
+            Ok(_) => return Err(format_err!("Unhandled channel type")),
+            Err(e) => {
+                return Err(format_err!(
+                        "An error occurred when creating the transport channel over interface {:?}: {}",
+                        &real_iface
                         e
                     ))
-                }
-            };
+            }
+        };
 
         let (mut tun_sender, mut tun_receiver) =
             match datalink::channel(tunnel_iface, Default::default()) {
@@ -149,7 +159,7 @@ impl IcmpTunnel {
 
     /// Starts the operation of the tunnel.
     /// If we are serving as a client, this will wrap outgoing traffic as ICMP.
-    pub fn start<S: AsRef<str>>(&mut self, iface_name: S) -> Result<(), Error> {
+    pub fn start<S: AsRef<str>>(&self, iface_name: S) -> Result<(), Error> {
         let raw_interface = IcmpTunnel::get_interface(iface_name)?;
 
         match self.operation_mode {
@@ -157,7 +167,7 @@ impl IcmpTunnel {
                 loop {
                     // When we are running as a client, our "raw_receiver" channel will be the outgoing direction.
                     // We only look for incoming ICMPReplay packets, and we decode them and write to the tunnel.
-                    match self.raw_receiver.next() {
+                    match self.raw_receiver.borrow_mut().next() {
                         Ok(packet) => {
                             let packet = EthernetPacket::new(packet).unwrap();
                             self.handle_ethernet_frame(&raw_interface, &packet);
@@ -174,7 +184,7 @@ impl IcmpTunnel {
     }
 
     fn handle_icmp_packet(
-        &mut self,
+        &self,
         interface_name: &str,
         source: IpAddr,
         destination: IpAddr,
@@ -183,39 +193,37 @@ impl IcmpTunnel {
         let icmp_packet = IcmpPacket::new(packet);
         if let Some(icmp_packet) = icmp_packet {
             match icmp_packet.get_icmp_type() {
-                IcmpTypes::EchoReply => {
-                    match self.operation_mode {
-                        OperationMode::Client(_) => {
-                            let echo_reply_packet =
-                                echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
-                            info!(
-                                "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
-                                interface_name,
-                                source,
-                                destination,
-                                echo_reply_packet.get_sequence_number(),
-                                echo_reply_packet.get_identifier()
-                            );
-                            let data = &icmp_packet.payload()[4..];
-                            let underlying = Ipv4Packet::new(data).expect("Malformed payload");
+                IcmpTypes::EchoReply => match self.operation_mode {
+                    OperationMode::Client(_) => {
+                        let echo_reply_packet =
+                            echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
+                        info!(
+                            "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
+                            interface_name,
+                            source,
+                            destination,
+                            echo_reply_packet.get_sequence_number(),
+                            echo_reply_packet.get_identifier()
+                        );
+                        let data = &icmp_packet.payload();
 
-                            match self.dev.write(underlying.packet()) {
-                                Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
-                                Err(e) => error!(
-                                    "Failed to write to tunnel device! Error - {:?}, data {:#?}",
-                                    e, underlying
-                                ),
-                            };
-                        }
-
-                        _ => {}
+                        match self.tun_sender.borrow_mut().send_to(data, None).packet() {
+                            Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
+                            Err(e) => error!(
+                                "Failed to write to tunnel device! Error - {:?}, data {:#?}",
+                                e, underlying
+                            ),
+                        };
                     }
-                }
+
+                    _ => {}
+                },
                 IcmpTypes::EchoRequest => {
                     match self.operation_mode {
                         OperationMode::Server => {
                             let echo_request_packet =
-                                echo_request::EchoRequestPacket::new(icmp_packet.payload()).unwrap();
+                                echo_request::EchoRequestPacket::new(icmp_packet.payload())
+                                    .unwrap();
                             info!(
                                 "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
                                 interface_name,
@@ -230,7 +238,9 @@ impl IcmpTunnel {
                             let underlying = Ipv4Packet::new(data).expect("Malformed payload");
 
                             match self.dev.write(underlying.packet()) {
-                                Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
+                                Ok(bytes_written) => {
+                                    info!("Succsefully sent {} bytes", bytes_written)
+                                }
                                 Err(e) => error!(
                                     "Failed to write to tunnel device! Error - {:?}, data {:#?}",
                                     e, underlying
@@ -254,7 +264,7 @@ impl IcmpTunnel {
     }
 
     fn handle_transport_protocol(
-        &mut self,
+        &self,
         interface_name: &str,
         source: IpAddr,
         destination: IpAddr,
@@ -281,7 +291,7 @@ impl IcmpTunnel {
         }
     }
 
-    fn handle_ipv4_packet(&mut self, interface_name: &str, ethernet_frame: &EthernetPacket) {
+    fn handle_ipv4_packet(&self, interface_name: &str, ethernet_frame: &EthernetPacket) {
         let ipv4_packet = Ipv4Packet::new(ethernet_frame.payload());
 
         if let Some(header) = ipv4_packet {
@@ -297,7 +307,7 @@ impl IcmpTunnel {
         }
     }
 
-    fn handle_ethernet_frame(&mut self, interface: &NetworkInterface, ethernet: &EthernetPacket) {
+    fn handle_ethernet_frame(&self, interface: &NetworkInterface, ethernet: &EthernetPacket) {
         let interface_name = &interface.name[..];
         match ethernet.get_ethertype() {
             EtherTypes::Ipv4 => self.handle_ipv4_packet(interface_name, ethernet),
