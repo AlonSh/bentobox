@@ -15,6 +15,7 @@ use clap::{App, Arg, SubCommand};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::process::Command;
 
 const IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -59,10 +60,33 @@ fn setup_server_machine() -> Result<(), Error> {
     Ok(())
 }
 
+fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
+    info!("Modifying IP routing tables");
+
+    Command::new("route").args(&["del", "default"]).spawn()?;
+    Command::new("route")
+        .args(&[
+            "add",
+            "-host",
+            format!("{}", server),
+            "gw",
+            "255.255.255.0",
+            "dev",
+            iface.as_ref(),
+        ])
+        .spawn()?;
+
+    Command::new("route")
+        .args(&["add", "default", "gw", "10.0.0.1", "tun0"])
+        .spawn()?;
+
+    Ok(())
+}
+
 fn main() {
     env_logger::init();
     info!("bentobox started.");
-    
+
     let matches = {
         let client_subcommand = SubCommand::with_name("client").arg(
             Arg::with_name("server-ip")
@@ -97,11 +121,22 @@ fn main() {
             setup_server_machine().expect("Failed to set up server");
 
             info!("Setting up tunnel interface 'tun0'");
-            let mut tunnel = IcmpTunnel::server("eth0", "tun0").expect("Failed to create tunnel");
+            let mut tunnel = IcmpTunnel::server(iface, "tun0").expect("Failed to create tunnel");
 
             info!("Starting to listen for packets.");
             // Run server.
             tunnel.start(iface).expect("Something bad happened");
+        }
+        ("client", Some(matches)) => {
+            info!("Running as client.");
+            let server_ip = matches.value_of("server-ip").expect("A required argument");
+            info!("Setting up tunnel interface 'tun0'");
+            let mut tunnel = IcmpTunnel::client(iface, "tun0", server_ip.parse())
+                .expect("Failed to create tunnel");
+
+            setup_client_machine(server_ip.parse(), iface).expect("Failed to set up client");
+
+            tunnel.start(iface).expect("Something bad happened")
         }
         _ => unimplemented!(),
     }
