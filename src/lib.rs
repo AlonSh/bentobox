@@ -10,14 +10,20 @@ use failure::Error;
 
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
-use pnet::transport::{self, IcmpTransportChannelIterator, TransportReceiver, TransportSender};
+use pnet::transport::{
+    self, icmp_packet_iter, transport_channel, IcmpTransportChannelIterator, TransportReceiver,
+    TransportSender,
+};
 
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
+use pnet::packet::icmp::echo_reply::MutableEchoReplyPacket;
+
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
-use pnet::transport::TransportChannelType::Layer4;
+use pnet::transport::TransportChannelType::Layer3;
 use pnet::transport::TransportProtocol::Ipv4;
 use std::cell::RefCell;
 use std::io::Write;
@@ -33,8 +39,8 @@ pub struct IcmpTunnel {
     // The TUN device used to send packets.
     dev: Device,
     operation_mode: OperationMode,
-    raw_sender: RefCell<Box<DataLinkSender>>,
-    raw_receiver: RefCell<Box<DataLinkReceiver>>,
+    raw_sender: RefCell<Box<TransportSender>>,
+    raw_receiver: RefCell<Box<TransportReceiver>>,
     tun_sender: RefCell<Box<DataLinkSender>>,
     tun_receiver: RefCell<Box<DataLinkReceiver>>,
 }
@@ -82,18 +88,17 @@ impl IcmpTunnel {
         ),
         Error,
     > {
-        let icmp_proto = Layer4(Ipv4(IpNextHeaderProtocols::Icmp));
+        let icmp_proto = Layer3(IpNextHeaderProtocols::Icmp);
 
         // Create a new channel over our outgoing interface.
-        let (mut raw_sender, mut raw_receiver) = match transport::channel(real_iface, icmp_proto) {
-            Ok(Ethernet(tx, rx)) => (tx, rx),
-            Ok(_) => return Err(format_err!("Unhandled channel type")),
+        let (mut raw_sender, mut raw_receiver) = match transport_channel(4096, icmp_proto) {
+            Ok((tx, rx)) => (tx, rx),
             Err(e) => {
                 return Err(format_err!(
-                        "An error occurred when creating the transport channel over interface {:?}: {}",
-                        &real_iface
-                        e
-                    ))
+                    "An error occurred when creating the transport channel over interface {:?}: {}",
+                    &real_iface,
+                    e
+                ))
             }
         };
 
@@ -109,7 +114,10 @@ impl IcmpTunnel {
                 }
             };
 
-        Ok(((raw_sender, raw_receiver), (tun_sender, tun_receiver)))
+        Ok((
+            (Box::new(raw_sender), Box::new(raw_receiver)),
+            (tun_sender, tun_receiver),
+        ))
     }
 
     pub fn client<T: AsRef<str>, I: AsRef<str>>(
@@ -128,10 +136,10 @@ impl IcmpTunnel {
         Ok(IcmpTunnel {
             dev: tunnel,
             operation_mode: OperationMode::Client(server_address.clone()),
-            raw_sender,
-            raw_receiver,
-            tun_sender,
-            tun_receiver,
+            raw_sender: RefCell::new(raw_sender),
+            raw_receiver: RefCell::new(raw_receiver),
+            tun_sender: RefCell::new(tun_sender),
+            tun_receiver: RefCell::new(tun_receiver),
         })
     }
 
@@ -150,27 +158,64 @@ impl IcmpTunnel {
         Ok(IcmpTunnel {
             dev: tunnel,
             operation_mode: OperationMode::Server,
-            raw_sender,
-            raw_receiver,
-            tun_sender,
-            tun_receiver,
+            raw_sender: RefCell::new(raw_sender),
+            raw_receiver: RefCell::new(raw_receiver),
+            tun_sender: RefCell::new(tun_sender),
+            tun_receiver: RefCell::new(tun_receiver),
         })
     }
 
     /// Starts the operation of the tunnel.
     /// If we are serving as a client, this will wrap outgoing traffic as ICMP.
     pub fn start<S: AsRef<str>>(&self, iface_name: S) -> Result<(), Error> {
-        let raw_interface = IcmpTunnel::get_interface(iface_name)?;
+        let raw_interface = IcmpTunnel::get_interface(&iface_name.as_ref())?;
+        // When we are running as a client, our "raw_receiver" channel will be the outgoing direction.
+        // We only look for incoming ICMPReplay packets, and we decode them and write to the tunnel.
+        let mut raw_reciever = self.raw_receiver.borrow_mut();
+        let mut incoming_icmp_packets = icmp_packet_iter(&mut raw_reciever);
 
         match self.operation_mode {
             OperationMode::Client(server_addr) => {
                 loop {
-                    // When we are running as a client, our "raw_receiver" channel will be the outgoing direction.
-                    // We only look for incoming ICMPReplay packets, and we decode them and write to the tunnel.
-                    match self.raw_receiver.borrow_mut().next() {
-                        Ok(packet) => {
-                            let packet = EthernetPacket::new(packet).unwrap();
-                            self.handle_ethernet_frame(&raw_interface, &packet);
+                    match incoming_icmp_packets.next() {
+                        // The addr should always be from the server
+                        Ok((packet, addr)) => {
+                            // Send to original packet into the tunnel
+                            // We pass None as the destination since this a datalink channel
+                            // (the data is already included in the packet).
+                            debug!(
+                                "[{}] recieved ICMP packet from {}",
+                                &iface_name.as_ref(),
+                                addr
+                            );
+                            debug!("sending {} bytes to tunnel", packet.payload().len());
+                            self.tun_sender.borrow_mut().send_to(packet.payload(), None);
+                        }
+                        Err(e) => {
+                            // If an error occurs, we can handle it here
+                            panic!("An error occurred while reading: {}", e);
+                        }
+                    }
+                    // Outgoing packets in the tunnel need to be wrapped in ICMP
+                    match self.tun_receiver.borrow_mut().next() {
+                        Ok(packet_data) => {
+                            debug!(
+                                "[{}] recieved packet of len from tunnel {}",
+                                "tun0",
+                                packet_data.len()
+                            );
+                            debug!(
+                                "[{}] Sending ICMP packet to server - data len {}",
+                                &iface_name.as_ref(),
+                                packet_data.len()
+                            );
+                            let mut outgoing_buffer = [0_u8; 4096];
+                            let mut icmp_request = MutableEchoRequestPacket::new(&mut outgoing_buffer).unwrap();
+                            icmp_request.set_payload(packet_data);
+
+                            self.raw_sender
+                                .borrow_mut()
+                                .send_to(icmp_request, IpAddr::V4(server_addr));
                         }
                         Err(e) => {
                             // If an error occurs, we can handle it here
@@ -179,145 +224,65 @@ impl IcmpTunnel {
                     }
                 }
             }
-            _ => unimplemented!(),
-        };
-    }
+            OperationMode::Server => {
+                loop {
+                    // We currently don't really support multiple clients, since we don't keep track of sessions.
+                    // We accept the first address that starts sending packets and reply to that address only.
+                    let mut client_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
 
-    fn handle_icmp_packet(
-        &self,
-        interface_name: &str,
-        source: IpAddr,
-        destination: IpAddr,
-        packet: &[u8],
-    ) {
-        let icmp_packet = IcmpPacket::new(packet);
-        if let Some(icmp_packet) = icmp_packet {
-            match icmp_packet.get_icmp_type() {
-                IcmpTypes::EchoReply => match self.operation_mode {
-                    OperationMode::Client(_) => {
-                        let echo_reply_packet =
-                            echo_reply::EchoReplyPacket::new(icmp_packet.payload()).unwrap();
-                        info!(
-                            "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
-                            interface_name,
-                            source,
-                            destination,
-                            echo_reply_packet.get_sequence_number(),
-                            echo_reply_packet.get_identifier()
-                        );
-                        let data = &icmp_packet.payload();
-
-                        match self.tun_sender.borrow_mut().send_to(data, None).packet() {
-                            Ok(bytes_written) => info!("Succsefully sent {} bytes", bytes_written),
-                            Err(e) => error!(
-                                "Failed to write to tunnel device! Error - {:?}, data {:#?}",
-                                e, underlying
-                            ),
-                        };
-                    }
-
-                    _ => {}
-                },
-                IcmpTypes::EchoRequest => {
-                    match self.operation_mode {
-                        OperationMode::Server => {
-                            let echo_request_packet =
-                                echo_request::EchoRequestPacket::new(icmp_packet.payload())
-                                    .unwrap();
-                            info!(
-                                "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
-                                interface_name,
-                                source,
-                                destination,
-                                echo_request_packet.get_sequence_number(),
-                                echo_request_packet.get_identifier()
+                    match incoming_icmp_packets.next() {
+                        Ok((packet, client)) => {
+                            // Send to original packet into the tunnel
+                            // We pass None as the destination since this a datalink channel
+                            // (the data is already included in the packet).
+                            debug!(
+                                "[{}] recieved ICMP packet from {}",
+                                &iface_name.as_ref(),
+                                client
                             );
-
-                            //                    let data = &icmp_packet.payload()[4..];
-                            let data = &icmp_packet.payload()[4..];
-                            let underlying = Ipv4Packet::new(data).expect("Malformed payload");
-
-                            match self.dev.write(underlying.packet()) {
-                                Ok(bytes_written) => {
-                                    info!("Succsefully sent {} bytes", bytes_written)
-                                }
-                                Err(e) => error!(
-                                    "Failed to write to tunnel device! Error - {:?}, data {:#?}",
-                                    e, underlying
-                                ),
+                            match client {
+                                IpAddr::V4(addr) => client_addr = addr,
+                                IpAddr::V6(addr) => panic!("Ipv6 clients are not supported!")
                             };
+
+                            debug!("sending {} bytes to tunnel", packet.payload().len());
+                            self.tun_sender.borrow_mut().send_to(packet.payload(), None);
                         }
-                        _ => {}
+                        Err(e) => {
+                            // If an error occurs, we can handle it here
+                            panic!("An error occurred while reading: {}", e);
+                        }
+                    }
+                    // Outgoing packets in the tunnel need to be wrapped in ICMP Replay
+                    match self.tun_receiver.borrow_mut().next() {
+                        Ok(packet_data) => {
+                            debug!(
+                                "[{}] recieved packet of len from tunnel {}",
+                                "tun0",
+                                packet_data.len()
+                            );
+                            // Craft reply packet
+                            let mut outgoing_buffer = [0_u8; 4096];
+                            let mut outgoing_packet = MutableEchoReplyPacket::new(&mut outgoing_buffer).unwrap();
+                            outgoing_packet.set_payload(packet_data);
+
+                            debug!(
+                                "[{}] Sending ICMP packet to client {} - data len {}",
+                                &iface_name.as_ref(),
+                                &client_addr,
+                                packet_data.len()
+                            );
+                            self.raw_sender
+                                .borrow_mut()
+                                .send_to(outgoing_packet, IpAddr::V4(client_addr));
+                        }
+                        Err(e) => {
+                            // If an error occurs, we can handle it here
+                            panic!("An error occurred while reading: {}", e);
+                        }
                     }
                 }
-                _ => debug!(
-                    "[{}]: ICMP packet {} -> {} (type={:?})",
-                    interface_name,
-                    source,
-                    destination,
-                    icmp_packet.get_icmp_type()
-                ),
             }
-        } else {
-            error!("[{}]: Malformed ICMP Packet", interface_name);
-        }
-    }
-
-    fn handle_transport_protocol(
-        &self,
-        interface_name: &str,
-        source: IpAddr,
-        destination: IpAddr,
-        protocol: IpNextHeaderProtocol,
-        packet: &[u8],
-    ) {
-        // We only need to handle ICMP packets.
-        match protocol {
-            IpNextHeaderProtocols::Icmp => {
-                self.handle_icmp_packet(interface_name, source, destination, packet)
-            }
-            _ => debug!(
-                "[{iface}]: {kind} packet: {src} > {dst}; protocol: {proto:?} length: {len}",
-                iface = interface_name,
-                kind = match source {
-                    IpAddr::V4(..) => "IPv4",
-                    _ => "IPv6",
-                },
-                src = source,
-                dst = destination,
-                proto = protocol,
-                len = packet.len()
-            ),
-        }
-    }
-
-    fn handle_ipv4_packet(&self, interface_name: &str, ethernet_frame: &EthernetPacket) {
-        let ipv4_packet = Ipv4Packet::new(ethernet_frame.payload());
-
-        if let Some(header) = ipv4_packet {
-            self.handle_transport_protocol(
-                interface_name,
-                IpAddr::V4(header.get_source()),
-                IpAddr::V4(header.get_destination()),
-                header.get_next_level_protocol(),
-                header.payload(),
-            );
-        } else {
-            error!("[{}]: Malformed IPv4 Packet", interface_name);
-        }
-    }
-
-    fn handle_ethernet_frame(&self, interface: &NetworkInterface, ethernet: &EthernetPacket) {
-        let interface_name = &interface.name[..];
-        match ethernet.get_ethertype() {
-            EtherTypes::Ipv4 => self.handle_ipv4_packet(interface_name, ethernet),
-            _ => debug!(
-                "Unknown packet: {} > {}; ethertype: {:?} length: {}",
-                ethernet.get_source(),
-                ethernet.get_destination(),
-                ethernet.get_ethertype(),
-                ethernet.packet().len()
-            ),
-        }
+        };
     }
 }

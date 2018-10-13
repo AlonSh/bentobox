@@ -61,6 +61,8 @@ fn setup_server_machine() -> Result<(), Error> {
 
 fn main() {
     env_logger::init();
+    info!("bentobox started.");
+    
     let matches = {
         let client_subcommand = SubCommand::with_name("client").arg(
             Arg::with_name("server-ip")
@@ -95,7 +97,7 @@ fn main() {
             setup_server_machine().expect("Failed to set up server");
 
             info!("Setting up tunnel interface 'tun0'");
-            let mut tunnel = IcmpTunnel::server("tun0").expect("Failed to create tunnel");
+            let mut tunnel = IcmpTunnel::server("eth0", "tun0").expect("Failed to create tunnel");
 
             info!("Starting to listen for packets.");
             // Run server.
