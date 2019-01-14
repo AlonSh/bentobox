@@ -1,4 +1,5 @@
 [package]
+edition = "2018"
 name = "bentobox"
 version = "0.1.0"
 authors = ["Omer Ben-Amram <omerbenamram@gmail.com>"]
@@ -11,3 +12,4 @@ failure = "*"
 clap = "*"
 libc = "*"
 env_logger = "*"
+rand = "*"
