@@ -1,16 +1,8 @@
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate log;
-extern crate env_logger;
+use failure::{format_err, Error};
+use log::{debug, error, info, trace};
 
-extern crate bentobox;
-extern crate clap;
-extern crate libc;
-
-use failure::Error;
-
-use bentobox::IcmpTunnel;
+use bentobox::client::client_main;
+use bentobox::server::server_main;
 use clap::{App, Arg, SubCommand};
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -28,13 +20,14 @@ fn is_running_as_root() -> bool {
 
 fn setup_server_machine() -> Result<(), Error> {
     info!("Preventing the kernel to reply to any ICMP pings");
+
     match OpenOptions::new().write(true).open(ICMP_ECHO_IGNORE_ALL) {
         Ok(mut f) => f.write_all(String::from("1\n").as_bytes()),
         Err(e) => {
             return Err(format_err!(
                 "Unable to set icmp_echo_ignore_all, error - {}",
                 e
-            ))
+            ));
         }
     }?;
 
@@ -45,6 +38,7 @@ fn setup_server_machine() -> Result<(), Error> {
     }?;
 
     info!("Adding an iptables rule to masquerade for 10.0.0.0/8");
+
     Command::new("iptables")
         .args(&[
             "-t",
@@ -64,7 +58,10 @@ fn setup_server_machine() -> Result<(), Error> {
 fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
     info!("Modifying IP routing tables");
 
+    // Deletes the default route from the machine, to cleanup old configuration.
     Command::new("route").args(&["del", "default"]).spawn()?;
+
+    // Adds a specific route to the internet facing device that points to the server.
     Command::new("route")
         .args(&[
             "add",
@@ -77,6 +74,7 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
         ])
         .spawn()?;
 
+    // Route everything else via the tunnel.
     Command::new("route")
         .args(&["add", "default", "gw", "10.0.0.1", "tun0"])
         .spawn()?;
@@ -116,17 +114,15 @@ fn main() {
     }
 
     let iface = matches.value_of("iface").expect("A required argument");
+
     match matches.subcommand() {
         ("server", Some(matches)) => {
             info!("Running as server.");
             setup_server_machine().expect("Failed to set up server");
 
             info!("Setting up tunnel interface 'tun0'");
-            let mut tunnel = IcmpTunnel::server(iface, "tun0").expect("Failed to create tunnel");
-
             info!("Starting to listen for packets.");
-            // Run server.
-            tunnel.start(iface).expect("Something bad happened");
+            server_main("tun0", iface).expect("Main loop failed");
         }
         ("client", Some(matches)) => {
             info!("Running as client.");
@@ -141,12 +137,8 @@ fn main() {
             };
 
             info!("Setting up tunnel interface 'tun0'");
-            let mut tunnel = IcmpTunnel::client(iface, "tun0", &server_addr_ipv4)
-                .expect("Failed to create tunnel");
-
             setup_client_machine(&server_addr_ipv4, iface).expect("Failed to set up client");
-
-            tunnel.start(iface).expect("Something bad happened")
+            client_main(iface, "tun0", &server_addr_ipv4).expect("Main loop failed");
         }
         _ => unimplemented!(),
     }
