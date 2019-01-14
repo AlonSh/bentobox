@@ -1,5 +1,5 @@
 use failure::{format_err, Error};
-use log::{debug, error, info, trace};
+use log::{debug, error, info, log, trace};
 
 use crate::tunnel::{get_interface_by_name, setup_tun_device, setup_tunnel};
 use std::net::IpAddr;
@@ -7,12 +7,14 @@ use std::net::Ipv4Addr;
 use std::sync::RwLock;
 use std::thread;
 
+use pnet::util::checksum;
 use pnet::{
     packet::{
         ethernet::{EtherTypes, EthernetPacket},
         icmp::{
-            echo_reply::MutableEchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpPacket,
-            IcmpTypes,
+            echo_reply::{self, MutableEchoReplyPacket},
+            echo_request::{self, MutableEchoRequestPacket},
+            IcmpPacket, IcmpTypes,
         },
         ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
         ipv4::{Ipv4Packet, MutableIpv4Packet},
@@ -20,6 +22,7 @@ use pnet::{
     },
     transport::{icmp_packet_iter, TransportChannelType::Layer3, TransportProtocol::Ipv4},
 };
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,8 +40,8 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let ((mut raw_sender, mut raw_receiver), (mut tun_sender, mut tun_receiver)) =
         setup_tunnel(&inet_iface, &tun_iface)?;
 
-    let inet_iface_name = Arc::new(format!("{}", inet_iface));
-    let tun_iface_name = Arc::new(format!("{}", tun_iface));
+    let inet_iface_name = Arc::new(inet_iface.name.clone());
+    let tun_iface_name = Arc::new(tun_iface.name.clone());
 
     // We currently don't really support multiple clients, since we don't keep track of sessions.
     // We accept the first address that starts sending packets and reply to that address only.
@@ -47,6 +50,8 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let o_inet_iface_name = inet_iface_name.clone();
     let o_tun_iface_name = tun_iface_name.clone();
     let o_client_addr = client_addr.clone();
+
+    info!("Starting to listen for packets.");
     let datalink_sr = thread::spawn(move || {
         let mut incoming_icmp_packets = icmp_packet_iter(&mut raw_receiver);
 
@@ -58,7 +63,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                     // (the data is already included in the packet).
                     debug!(
                         "[{}] recieved ICMP packet from {}",
-                        &o_inet_iface_name.as_ref(),
+                        &o_inet_iface_name,
                         client
                     );
                     match client {
@@ -112,11 +117,21 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                         &i_tun_iface_name,
                         packet_data.len()
                     );
-                    // Craft reply packet
-                    let mut outgoing_buffer = [0_u8; 4096];
-                    let mut outgoing_packet =
+
+                    let mut outgoing_buffer = vec![0; packet_data.len() + 64];
+
+                    let mut icmp_reply =
                         MutableEchoReplyPacket::new(&mut outgoing_buffer).unwrap();
-                    outgoing_packet.set_payload(packet_data);
+
+                    icmp_reply.set_icmp_type(IcmpTypes::EchoReply);
+                    let mut rng = rand::thread_rng();
+                    icmp_reply.set_identifier(rng.gen::<u16>());
+                    icmp_reply.set_sequence_number(1);
+                    icmp_reply.set_icmp_code(echo_request::IcmpCodes::NoCode);
+                    icmp_reply.set_payload(packet_data);
+                    let checksum = checksum(icmp_reply.packet(), 1);
+                    icmp_reply.set_checksum(checksum);
+                    trace!("[SERVER_OUTGOING] Sending packet {:#?}", &icmp_reply);
 
                     debug!(
                         "[{}] Sending ICMP packet to client {} - data len {}",
@@ -124,9 +139,10 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                         &client_addr,
                         packet_data.len()
                     );
+
                     raw_sender
-                        .send_to(outgoing_packet, IpAddr::V4(client_addr))
-                        .expect("Failed to write to tunnel device!");
+                        .send_to(icmp_reply, IpAddr::V4(client_addr))
+                        .expect("Failed to write to inet device!");
                 }
                 Err(e) => {
                     // If an error occurs, we can handle it here

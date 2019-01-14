@@ -1,11 +1,12 @@
 use failure::{format_err, Error};
-use log::{log, debug, error, info, trace};
+use log::{debug, error, info, log, trace};
 
 use crate::tunnel::{get_interface_by_name, setup_tun_device, setup_tunnel};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::thread;
 
+use pnet::util::checksum;
 use pnet::{
     packet::{
         ethernet::{EtherTypes, EthernetPacket},
@@ -20,9 +21,8 @@ use pnet::{
     },
     transport::{icmp_packet_iter, TransportChannelType::Layer3, TransportProtocol::Ipv4},
 };
-use std::sync::Arc;
-use pnet::util::checksum;
 use rand::Rng;
+use std::sync::Arc;
 
 const CLIENT_TUN_ADDR: &'static str = "10.0.1.2";
 const ECHO_REPLY_HEADER_SIZE: usize = 64;
@@ -32,11 +32,6 @@ pub fn client_main(
     tunnel_iface_name: &str,
     server_addr: &Ipv4Addr,
 ) -> Result<(), Error> {
-    let tun_dev = setup_tun_device(
-        &tunnel_iface_name,
-        CLIENT_TUN_ADDR.parse().expect("This is a valid IPv4"),
-    )?;
-
     let inet_iface = get_interface_by_name(&real_iface_name)?;
     let tun_iface = get_interface_by_name(&tunnel_iface_name)?;
     let ((mut raw_sender, mut raw_receiver), (mut tun_sender, mut tun_receiver)) =
@@ -63,7 +58,7 @@ pub fn client_main(
                     debug!(
                         "[CLIENT_OUTGOING] Read packet of len {} from tunnel {}",
                         packet_data.len(),
-                        &o_inet_iface_name,
+                        &o_tun_iface_name,
                     );
 
                     debug!(
@@ -89,7 +84,7 @@ pub fn client_main(
                     icmp_request.set_payload(packet_data);
                     let checksum = checksum(icmp_request.packet(), 1);
                     icmp_request.set_checksum(checksum);
-                    trace!("[CLIENT_OUTGOING] Sending packet {:?}", &icmp_request);
+                    trace!("[CLIENT_OUTGOING] Sending packet {:#?}", &icmp_request);
 
                     match raw_sender.send_to(icmp_request, server_addr.clone()) {
                         Ok(bytes_written) => debug!(
@@ -124,6 +119,13 @@ pub fn client_main(
             match incoming_icmp_packets.next() {
                 // The addr should always be from the server
                 Ok((packet, addr)) => {
+                    if addr != server_addr {
+                        debug!(
+                            "Got an ICMP packet not from {} (not server), ignoring.",
+                            addr
+                        );
+                        continue;
+                    }
                     // Send to original packet into the tunnel
                     // We pass None as the destination since this a datalink channel
                     // (the data is already included in the packet).

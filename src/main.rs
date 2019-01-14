@@ -3,6 +3,7 @@ use log::{debug, error, info, trace};
 
 use bentobox::client::client_main;
 use bentobox::server::server_main;
+use bentobox::tunnel::setup_tun_device;
 use clap::{App, Arg, SubCommand};
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -55,28 +56,55 @@ fn setup_server_machine() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
     info!("Modifying IP routing tables");
 
     // Deletes the default route from the machine, to cleanup old configuration.
-    Command::new("route").args(&["del", "default"]).spawn()?;
+    Command::new("route").args(&["delete", "default"]).spawn()?;
 
     // Adds a specific route to the internet facing device that points to the server.
     Command::new("route")
+        .args(&["add", &format!("{}", &server), "192.168.88.1"])
+        .spawn()?;
+
+    // Route everything else via the tunnel.
+    Command::new("route")
+        .args(&["add", "default", "-interface", "utun5"])
+        .spawn()?;
+
+    Command::new("networksetup")
+        .args(&["-setdnsservers", "Wi-Fi", "8.8.8.8"])
+        .spawn();
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
+    info!("Modifying IP routing tables");
+
+    // Deletes the default route from the machine, to cleanup old configuration.
+    Command::new("ip")
+        .args(&["route", "del", "default"])
+        .spawn()?;
+
+    // Adds a specific route to the internet facing device that points to the server.
+    Command::new("ip")
         .args(&[
+            "route",
             "add",
-            "-host",
             &format!("{}", &server),
-            "gw",
-            "255.255.255.0",
+            "via",
+            "192.168.75.133",
             "dev",
             iface.as_ref(),
         ])
         .spawn()?;
 
     // Route everything else via the tunnel.
-    Command::new("route")
-        .args(&["add", "default", "gw", "10.0.1.2", "tun0"])
+    Command::new("ip")
+        .args(&["route", "add", "default", "via", "10.0.1.2", "dev", "tun0"])
         .spawn()?;
 
     Ok(())
@@ -121,7 +149,6 @@ fn main() {
             setup_server_machine().expect("Failed to set up server");
 
             info!("Setting up tunnel interface 'tun0'");
-            info!("Starting to listen for packets.");
             server_main("tun0", iface).expect("Main loop failed");
         }
         ("client", Some(matches)) => {
@@ -136,9 +163,23 @@ fn main() {
                 IpAddr::V6(addr) => panic!("Ipv6 addresses are not supported"),
             };
 
-            info!("Setting up tunnel interface 'tun0'");
+            // Strange behavior of `tun` crate on macos causes the index to be off by 1.
+            let (target_tun, real_tun_name) = if cfg!(target_os = "macos") {
+                ("utun6", "utun5")
+            } else {
+                ("tun0", "tun0")
+            };
+
+            info!("Setting up tunnel interface '{}'", real_tun_name);
+
+            let tun_dev = setup_tun_device(
+                &target_tun,
+                "10.0.1.2".parse().expect("This is a valid IPv4"),
+            )
+            .expect("Failed to setup tunnel");
+
             setup_client_machine(&server_addr_ipv4, iface).expect("Failed to set up client");
-            client_main(iface, "tun0", &server_addr_ipv4).expect("Main loop failed");
+            client_main(iface, real_tun_name, &server_addr_ipv4).expect("Main loop failed");
         }
         _ => unimplemented!(),
     }

@@ -43,10 +43,13 @@ pub fn setup_tun_device(name: impl AsRef<str>, address: Ipv4Addr) -> Result<Devi
         .mtu(1472)
         .up();
 
-    let mut dev = tun::create(&config).ok().ok_or(format_err!(
-        "Failed to create tunnel device {:?}",
-        name.as_ref()
-    ))?;
+    let mut dev = tun::create(&config).map_err(|e| {
+        format_err!(
+            "Failed to create tunnel device {:?} - {:?}",
+            name.as_ref(),
+            e
+        )
+    })?;
 
     info!(
         "Tunnel {:?} was set up with config {:?}",
