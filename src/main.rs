@@ -178,7 +178,7 @@ fn main() {
                 .parse()
                 .expect(&format!("{} is not a valid ip", &server_ip_str));
 
-            let gateway_ip: IpAddr = gateway_ip_str
+            let gateway_ip: Ipv4Addr = gateway_ip_str
                 .parse()
                 .expect(&format!("{} is not a valid ip", &gateway_ip_str));
 
@@ -202,7 +202,7 @@ fn main() {
             )
             .expect("Failed to setup tunnel");
 
-            setup_client_machine(&server_addr_ipv4, gateway_ip_str, iface)
+            setup_client_machine(&server_addr_ipv4, &gateway_ip, iface)
                 .expect("Failed to set up client");
             client_main(iface, real_tun_name, &server_addr_ipv4).expect("Main loop failed");
         }

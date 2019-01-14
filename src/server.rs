@@ -52,7 +52,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let o_client_addr = client_addr.clone();
 
     info!("Starting to listen for packets.");
-    let datalink_sr = thread::spawn(move || {
+    let incoming = thread::spawn(move || {
         let mut incoming_icmp_packets = icmp_packet_iter(&mut raw_receiver);
 
         loop {
@@ -63,8 +63,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                     // (the data is already included in the packet).
                     debug!(
                         "[{}] recieved ICMP packet from {}",
-                        &o_inet_iface_name,
-                        client
+                        &o_inet_iface_name, client
                     );
                     match client {
                         IpAddr::V4(addr) => {
@@ -74,9 +73,19 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                             if !client_locked {
                                 let mut lock = o_client_addr.write().expect("Lock poisoned");
                                 *lock = Some(addr);
+                            } else {
+                                debug!(
+                                    "Ignoring ICMP packet from client {} - known client is {}",
+                                    addr,
+                                    o_client_addr
+                                        .read()
+                                        .expect("Lock poisoned")
+                                        .expect("Client is already locked")
+                                );
+                                continue;
                             }
                         }
-                        IpAddr::V6(addr) => panic!("Ipv6 clients are not supported!"),
+                        IpAddr::V6(addr) => error!("Ipv6 clients are not supported!"),
                     };
 
                     debug!("sending {} bytes to tunnel", packet.payload().len());
@@ -95,7 +104,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let i_client_addr = client_addr.clone();
 
     // Outgoing packets in the tunnel need to be wrapped in ICMP Replay
-    let raw_sr = thread::spawn(move || {
+    let outgoing = thread::spawn(move || {
         let client_addr = loop {
             match *i_client_addr.read().expect("RAW_SR: Lock poisoned") {
                 Some(addr) => break addr,
@@ -120,8 +129,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
 
                     let mut outgoing_buffer = vec![0; packet_data.len() + 64];
 
-                    let mut icmp_reply =
-                        MutableEchoReplyPacket::new(&mut outgoing_buffer).unwrap();
+                    let mut icmp_reply = MutableEchoReplyPacket::new(&mut outgoing_buffer).unwrap();
 
                     icmp_reply.set_icmp_type(IcmpTypes::EchoReply);
                     let mut rng = rand::thread_rng();
@@ -152,8 +160,8 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
         }
     });
 
-    datalink_sr.join().unwrap();
-    raw_sr.join().unwrap();
+    incoming.join().unwrap();
+    outgoing.join().unwrap();
 
     Ok(())
 }
