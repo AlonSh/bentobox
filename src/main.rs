@@ -57,7 +57,11 @@ fn setup_server_machine() -> Result<(), Error> {
 }
 
 #[cfg(target_os = "macos")]
-fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
+fn setup_client_machine<S: AsRef<str>>(
+    server: &Ipv4Addr,
+    gateway_ip: &Ipv4Addr,
+    iface: S,
+) -> Result<(), Error> {
     info!("Modifying IP routing tables");
 
     // Deletes the default route from the machine, to cleanup old configuration.
@@ -65,7 +69,7 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
 
     // Adds a specific route to the internet facing device that points to the server.
     Command::new("route")
-        .args(&["add", &format!("{}", &server), "192.168.88.1"])
+        .args(&["add", &format!("{}", &server), &format!("{}", &gateway_ip)])
         .spawn()?;
 
     // Route everything else via the tunnel.
@@ -75,18 +79,26 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
 
     Command::new("networksetup")
         .args(&["-setdnsservers", "Wi-Fi", "8.8.8.8"])
-        .spawn();
+        .spawn()?;
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<(), Error> {
+fn setup_client_machine<S: AsRef<str>>(
+    server: &Ipv4Addr,
+    gateway_ip: &Ipv4Addr,
+    iface: S,
+) -> Result<(), Error> {
     info!("Modifying IP routing tables");
 
     // Deletes the default route from the machine, to cleanup old configuration.
     Command::new("ip")
         .args(&["route", "del", "default"])
+        .spawn()?;
+
+    Command::new("ip")
+        .args(&["route", "del", &format!("{}", &server)])
         .spawn()?;
 
     // Adds a specific route to the internet facing device that points to the server.
@@ -96,7 +108,7 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
             "add",
             &format!("{}", &server),
             "via",
-            "192.168.75.133",
+            &format!("{}", &gateway_ip),
             "dev",
             iface.as_ref(),
         ])
@@ -115,12 +127,19 @@ fn main() {
     info!("bentobox started.");
 
     let matches = {
-        let client_subcommand = SubCommand::with_name("client").arg(
-            Arg::with_name("server-ip")
-                .takes_value(true)
-                .required(true)
-                .help("IP address of the relay server"),
-        );
+        let client_subcommand = SubCommand::with_name("client")
+            .arg(
+                Arg::with_name("server-ip")
+                    .takes_value(true)
+                    .required(true)
+                    .help("IP address of the relay server"),
+            )
+            .arg(
+                Arg::with_name("gateway-ip")
+                    .takes_value(true)
+                    .required(true)
+                    .help("IP address of the current internet-facing gateway"),
+            );
 
         let app = App::new("Bentobox")
             .version("2018-10")
@@ -154,9 +173,14 @@ fn main() {
         ("client", Some(matches)) => {
             info!("Running as client.");
             let server_ip_str = matches.value_of("server-ip").expect("A required argument");
+            let gateway_ip_str = matches.value_of("gateway-ip").expect("A required argument");
             let server_ip: IpAddr = server_ip_str
                 .parse()
                 .expect(&format!("{} is not a valid ip", &server_ip_str));
+
+            let gateway_ip: IpAddr = gateway_ip_str
+                .parse()
+                .expect(&format!("{} is not a valid ip", &gateway_ip_str));
 
             let server_addr_ipv4 = match server_ip {
                 IpAddr::V4(addr) => addr,
@@ -178,7 +202,8 @@ fn main() {
             )
             .expect("Failed to setup tunnel");
 
-            setup_client_machine(&server_addr_ipv4, iface).expect("Failed to set up client");
+            setup_client_machine(&server_addr_ipv4, gateway_ip_str, iface)
+                .expect("Failed to set up client");
             client_main(iface, real_tun_name, &server_addr_ipv4).expect("Main loop failed");
         }
         _ => unimplemented!(),

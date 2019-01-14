@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use failure::{format_err, Error};
 use log::{debug, error, info, trace};
 
@@ -8,6 +10,7 @@ use pnet::transport::{
     TransportSender,
 };
 
+mod utils;
 pub mod client;
 pub mod server;
 pub mod tunnel;

@@ -1,7 +1,8 @@
 use failure::{format_err, Error};
-use log::{debug, error, info, log, trace};
+use log::{debug, error, info, log, log_enabled, trace, Level};
 
 use crate::tunnel::{get_interface_by_name, setup_tun_device, setup_tunnel};
+use crate::utils::hexdump;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::thread;
@@ -84,7 +85,17 @@ pub fn client_main(
                     icmp_request.set_payload(packet_data);
                     let checksum = checksum(icmp_request.packet(), 1);
                     icmp_request.set_checksum(checksum);
-                    trace!("[CLIENT_OUTGOING] Sending packet {:#?}", &icmp_request);
+                    trace!(
+                        "[CLIENT_OUTGOING] Sending packet to {}",
+                        server_addr.clone(),
+                    );
+
+                    if log_enabled!(Level::Trace) {
+                        trace!("[CLIENT_OUTGOING] PACKET DATA:");
+                        trace!("{}", hexdump::hexdump(icmp_request.packet(), 0, 'C'));
+                        trace!("[CLIENT_OUTGOING] PACKET PAYLOAD:");
+                        trace!("{}", hexdump::hexdump(icmp_request.payload(), 0, 'C'));
+                    }
 
                     match raw_sender.send_to(icmp_request, server_addr.clone()) {
                         Ok(bytes_written) => debug!(
@@ -120,10 +131,7 @@ pub fn client_main(
                 // The addr should always be from the server
                 Ok((packet, addr)) => {
                     if addr != server_addr {
-                        debug!(
-                            "Got an ICMP packet not from {} (not server), ignoring.",
-                            addr
-                        );
+                        debug!("Got an ICMP packet from {} (not server), ignoring.", addr);
                         continue;
                     }
                     // Send to original packet into the tunnel
