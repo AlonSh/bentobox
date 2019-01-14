@@ -74,15 +74,19 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                                 let mut lock = o_client_addr.write().expect("Lock poisoned");
                                 *lock = Some(addr);
                             } else {
-                                debug!(
-                                    "Ignoring ICMP packet from client {} - known client is {}",
-                                    addr,
-                                    o_client_addr
-                                        .read()
-                                        .expect("Lock poisoned")
-                                        .expect("Client is already locked")
-                                );
-                                continue;
+                                let locked_addr = o_client_addr
+                                    .read()
+                                    .expect("Lock poisoned")
+                                    .expect("Client is already locked");
+
+                                if locked_addr != addr {
+                                    debug!(
+                                        "Ignoring ICMP packet from client {} - known client is {}",
+                                        addr,
+                                        locked_addr
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         IpAddr::V6(addr) => error!("Ipv6 clients are not supported!"),
