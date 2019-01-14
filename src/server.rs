@@ -93,7 +93,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                     };
 
                     debug!("sending {} bytes to tunnel", packet.payload().len());
-                    tun_sender.send_to(packet.payload(), None);
+                    tun_sender.send_to(&packet.payload()[4..], None);
                 }
                 Err(e) => {
                     // If an error occurs, we can handle it here
