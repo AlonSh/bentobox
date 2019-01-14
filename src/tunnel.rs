@@ -16,7 +16,7 @@ use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::Packet;
-use pnet::transport::TransportChannelType::Layer3;
+use pnet::transport::TransportChannelType::{Layer3, Layer4};
 use pnet::transport::TransportProtocol::Ipv4;
 
 use tun::platform::Device;
@@ -57,11 +57,14 @@ pub fn setup_tun_device(name: impl AsRef<str>, address: Ipv4Addr) -> Result<Devi
     Ok(dev)
 }
 
+/// Creates a tunnel over two interfaces:
+///     - `real_iface` will be used as the gateway to the internet, and will be handled at layer 4 (Transport)
+///     - `tunnel_iface` will be where application logic happens, and transport will be manipulated at the datalink level.
 pub fn setup_tunnel(
     real_iface: &NetworkInterface,
     tunnel_iface: &NetworkInterface,
 ) -> Result<(TransportPair, DatalinkPair), Error> {
-    let icmp_proto = Layer3(IpNextHeaderProtocols::Icmp);
+    let icmp_proto = Layer4(Ipv4(IpNextHeaderProtocols::Icmp));
 
     // Create a new channel over our outgoing interface.
     let (mut raw_sender, mut raw_receiver) = match transport_channel(4096, icmp_proto) {

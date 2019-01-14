@@ -76,7 +76,7 @@ fn setup_client_machine<S: AsRef<str>>(server: &Ipv4Addr, iface: S) -> Result<()
 
     // Route everything else via the tunnel.
     Command::new("route")
-        .args(&["add", "default", "gw", "10.0.0.1", "tun0"])
+        .args(&["add", "default", "gw", "10.0.1.2", "tun0"])
         .spawn()?;
 
     Ok(())

@@ -30,6 +30,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
         &tunnel_iface_name,
         SERVER_TUN_ADDR.parse().expect("This is a valid IPv4"),
     )?;
+
     let inet_iface = Arc::new(get_interface_by_name(&real_iface_name)?);
     let tun_iface = Arc::new(get_interface_by_name(&tunnel_iface_name)?);
 
