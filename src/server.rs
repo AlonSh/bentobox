@@ -9,17 +9,18 @@ use std::thread;
 
 use crate::utils::hexdump;
 use pnet::util::checksum;
+
 use pnet::{
     packet::{
         ethernet::{EtherTypes, EthernetPacket},
         icmp::{
-            echo_reply::{self, MutableEchoReplyPacket},
-            echo_request::{self, MutableEchoRequestPacket},
-            IcmpPacket, IcmpTypes,
+            echo_reply::{self, EchoReplyPacket, MutableEchoReplyPacket},
+            echo_request::{self, EchoRequestPacket, MutableEchoRequestPacket},
+            IcmpPacket, IcmpTypes, MutableIcmpPacket,
         },
         ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
         ipv4::{Ipv4Packet, MutableIpv4Packet},
-        Packet,
+        MutablePacket, Packet,
     },
     transport::{icmp_packet_iter, TransportChannelType::Layer3, TransportProtocol::Ipv4},
 };
@@ -55,6 +56,9 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
 
     info!("Starting to listen for packets.");
 
+    let mut sr_buffer = Arc::new(RwLock::new(Vec::new()));
+
+    let mut o_sr_buffer = sr_buffer.clone();
     let incoming = thread::spawn(move || {
         let mut incoming_icmp_packets = icmp_packet_iter(&mut raw_receiver);
 
@@ -97,18 +101,42 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                         }
                     };
 
+                    let mut write_guard = o_sr_buffer
+                        .write()
+                        .expect("[SERVER_INCOMING] Lock poisoned");
+
+                    // Clone packet into a shared buffer, so we can use it later.
+                    write_guard.clear();
+                    write_guard.write(packet.packet()).unwrap();
+
                     debug!(
                         "[SERVER_INCOMING] sending {} bytes to tunnel",
                         packet.payload().len()
                     );
 
                     if log_enabled!(Level::Trace) {
-                        trace!("[CLIENT_OUTGOING] PACKET DATA:");
-                        trace!("{}", hexdump::hexdump(packet.packet(), 0, 'C'));
-                        trace!("[CLIENT_OUTGOING] PACKET PAYLOAD:");
-                        trace!("{}", hexdump::hexdump(packet.payload(), 0, 'C'));
+                        match EchoRequestPacket::new(&packet.packet()) {
+                            Some(echo_request) => {
+                                trace!(
+                                    "[SERVER_INCOMING] \tICMP Type: {:?}",
+                                    echo_request.get_icmp_type()
+                                );
+                                trace!(
+                                    "[SERVER_INCOMING] \tPacket SEQ: {:?}",
+                                    echo_request.get_sequence_number()
+                                );
+                                trace!(
+                                    "[SERVER_INCOMING] \tPacket ID: {:?}",
+                                    echo_request.get_identifier()
+                                );
+                            }
+                            None => error!("[SERVER_INCOMING] not an echo request packet"),
+                        }
                     }
-                    tunnel.write(&packet.payload()[4..]).expect("Failed to write to tunnel");
+
+                    tunnel
+                        .write(&packet.payload()[4..])
+                        .expect("Failed to write to tunnel");
                 }
                 Err(e) => {
                     // If an error occurs, we can handle it here
@@ -121,6 +149,8 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let i_inet_iface_name = inet_iface_name.clone();
     let i_tun_iface_name = tun_iface_name.clone();
     let i_client_addr = client_addr.clone();
+
+    let mut i_sr_buffer = sr_buffer.clone();
 
     // Outgoing packets in the tunnel need to be wrapped in ICMP Replay
     let outgoing = thread::spawn(move || {
@@ -149,18 +179,42 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                         &i_tun_iface_name,
                     );
 
-                    let mut outgoing_buffer = vec![0; packet_data.len() + 64];
+                    let mut read_guard =
+                        i_sr_buffer.read().expect("[SERVER_INCOMING] Lock poisoned");
+
+                    let last_packet = EchoRequestPacket::new(&read_guard).unwrap();
+
+                    let mut outgoing_buffer = vec![0_u8; packet_data.len() + 64];
 
                     let mut icmp_reply = MutableEchoReplyPacket::new(&mut outgoing_buffer).unwrap();
-
                     icmp_reply.set_icmp_type(IcmpTypes::EchoReply);
-                    let mut rng = rand::thread_rng();
-                    icmp_reply.set_identifier(rng.gen::<u16>());
-                    icmp_reply.set_sequence_number(1);
-                    icmp_reply.set_icmp_code(echo_request::IcmpCodes::NoCode);
+                    icmp_reply.set_identifier(last_packet.get_identifier());
+                    icmp_reply.set_sequence_number(last_packet.get_sequence_number());
                     icmp_reply.set_payload(packet_data);
+
                     let checksum = checksum(icmp_reply.packet(), 1);
                     icmp_reply.set_checksum(checksum);
+
+                    if log_enabled!(Level::Trace) {
+                        match EchoReplyPacket::new(&icmp_reply.packet()) {
+                            Some(icmp_reply) => {
+                                trace!(
+                                    "[SERVER_OUTGOING] \tICMP Type: {:?}",
+                                    icmp_reply.get_icmp_type()
+                                );
+                                trace!(
+                                    "[SERVER_OUTGOING] \tPacket SEQ: {:?}",
+                                    icmp_reply.get_sequence_number()
+                                );
+                                trace!(
+                                    "[SERVER_OUTGOING] \tPacket ID: {:?}",
+                                    icmp_reply.get_identifier()
+                                );
+                            }
+                            None => error!("[SERVER_OUTGOING] not an echo reply packet"),
+                        }
+                    }
+
                     trace!("[SERVER_OUTGOING] Sending packet {:#?}", &icmp_reply);
 
                     debug!(

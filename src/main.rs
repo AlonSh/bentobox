@@ -196,12 +196,6 @@ fn main() {
 
             info!("Setting up tunnel interface '{}'", real_tun_name);
 
-            let tun_dev = setup_tun_device(
-                &target_tun,
-                "10.0.1.2".parse().expect("This is a valid IPv4"),
-            )
-            .expect("Failed to setup tunnel");
-
             setup_client_machine(&server_addr_ipv4, &gateway_ip, iface)
                 .expect("Failed to set up client");
             client_main(iface, real_tun_name, &server_addr_ipv4).expect("Main loop failed");

@@ -23,6 +23,7 @@ use pnet::{
     transport::{icmp_packet_iter, TransportChannelType::Layer3, TransportProtocol::Ipv4},
 };
 use rand::Rng;
+use std::io::Write;
 use std::sync::Arc;
 
 const CLIENT_TUN_ADDR: &'static str = "10.0.1.2";
@@ -33,6 +34,9 @@ pub fn client_main(
     tunnel_iface_name: &str,
     server_addr: &Ipv4Addr,
 ) -> Result<(), Error> {
+    let mut tun_dev = setup_tun_device("tun0", "10.0.1.2".parse().expect("This is a valid IPv4"))
+        .expect("Failed to setup tunnel");
+
     let inet_iface = get_interface_by_name(&real_iface_name)?;
     let tun_iface = get_interface_by_name(&tunnel_iface_name)?;
     let ((mut raw_sender, mut raw_receiver), (mut tun_sender, mut tun_receiver)) =
@@ -53,6 +57,7 @@ pub fn client_main(
         );
 
         loop {
+            let mut counter = 1;
             // Outgoing packets in the tunnel need to be wrapped in ICMP
             match tun_receiver.next() {
                 Ok(packet_data) => {
@@ -79,12 +84,14 @@ pub fn client_main(
 
                     icmp_request.set_icmp_type(IcmpTypes::EchoRequest);
                     let mut rng = rand::thread_rng();
-                    icmp_request.set_identifier(rng.gen::<u16>());
-                    icmp_request.set_sequence_number(1);
+                    icmp_request.set_identifier(1111_u16);
+                    icmp_request.set_sequence_number(counter);
                     icmp_request.set_icmp_code(echo_request::IcmpCodes::NoCode);
                     icmp_request.set_payload(packet_data);
                     let checksum = checksum(icmp_request.packet(), 1);
                     icmp_request.set_checksum(checksum);
+
+                    counter += 1;
                     trace!(
                         "[CLIENT_OUTGOING] Sending packet to {}",
                         server_addr.clone(),
@@ -148,18 +155,11 @@ pub fn client_main(
                         packet.payload().len(),
                         &i_tun_iface_name,
                     );
-                    match tun_sender.send_to(packet.payload(), None) {
-                        Some(result) => match result {
-                            Ok(_) => debug!(
-                                "[CLIENT_INCOMING] packet sent to {}",
-                                &i_tun_iface_name
-                            ),
-                            Err(e) => error!(
-                                "[CLIENT_INCOMING] An error occured while trying to send to {} - {}",
-                                &i_tun_iface_name, e
-                            ),
-                        },
-                        None => error!("[CLIENT_INCOMING] no response")
+                    match tun_dev.write(&packet.payload()[4..]) {
+                        Ok(bytes_written) => {
+                            debug!("[CLIENT_INCOMING] written {} to tun0", bytes_written)
+                        }
+                        Err(e) => error!("[CLIENT_INCOMING] error {}", e),
                     }
                 }
                 Err(e) => {
