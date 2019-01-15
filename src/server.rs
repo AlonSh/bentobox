@@ -1,5 +1,5 @@
 use failure::{format_err, Error};
-use log::{debug, error, info, log, trace};
+use log::{debug, error, info, log, log_enabled, trace, Level};
 
 use crate::tunnel::{get_interface_by_name, setup_tun_device, setup_tunnel};
 use std::net::IpAddr;
@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::sync::RwLock;
 use std::thread;
 
+use crate::utils::hexdump;
 use pnet::util::checksum;
 use pnet::{
     packet::{
@@ -23,13 +24,14 @@ use pnet::{
     transport::{icmp_packet_iter, TransportChannelType::Layer3, TransportProtocol::Ipv4},
 };
 use rand::Rng;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
 const SERVER_TUN_ADDR: &'static str = "10.0.1.1";
 
 pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(), Error> {
-    let tunnel = setup_tun_device(
+    let mut tunnel = setup_tun_device(
         &tunnel_iface_name,
         SERVER_TUN_ADDR.parse().expect("This is a valid IPv4"),
     )?;
@@ -52,6 +54,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     let o_client_addr = client_addr.clone();
 
     info!("Starting to listen for packets.");
+
     let incoming = thread::spawn(move || {
         let mut incoming_icmp_packets = icmp_packet_iter(&mut raw_receiver);
 
@@ -62,7 +65,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                     // We pass None as the destination since this a datalink channel
                     // (the data is already included in the packet).
                     debug!(
-                        "[{}] recieved ICMP packet from {}",
+                        "[SERVER_INCOMING] received ICMP packet at iface {} from {}",
                         &o_inet_iface_name, client
                     );
                     match client {
@@ -81,7 +84,7 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
 
                                 if locked_addr != addr {
                                     debug!(
-                                        "Ignoring ICMP packet from client {} - known client is {}",
+                                        "[SERVER_INCOMING] Ignoring ICMP packet from client {} - known client is {}",
                                         addr,
                                         locked_addr
                                     );
@@ -89,15 +92,27 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                                 }
                             }
                         }
-                        IpAddr::V6(addr) => error!("Ipv6 clients are not supported!"),
+                        IpAddr::V6(addr) => {
+                            error!("[SERVER_INCOMING] Ipv6 clients are not supported!")
+                        }
                     };
 
-                    debug!("sending {} bytes to tunnel", packet.payload().len());
-                    tun_sender.send_to(&packet.payload()[4..], None);
+                    debug!(
+                        "[SERVER_INCOMING] sending {} bytes to tunnel",
+                        packet.payload().len()
+                    );
+
+                    if log_enabled!(Level::Trace) {
+                        trace!("[CLIENT_OUTGOING] PACKET DATA:");
+                        trace!("{}", hexdump::hexdump(packet.packet(), 0, 'C'));
+                        trace!("[CLIENT_OUTGOING] PACKET PAYLOAD:");
+                        trace!("{}", hexdump::hexdump(packet.payload(), 0, 'C'));
+                    }
+                    tunnel.write(&packet.payload()[4..]).expect("Failed to write to tunnel");
                 }
                 Err(e) => {
                     // If an error occurs, we can handle it here
-                    panic!("An error occurred while reading: {}", e);
+                    error!("[SERVER_INCOMING] An error occurred while reading: {}", e);
                 }
             }
         }
@@ -110,10 +125,13 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
     // Outgoing packets in the tunnel need to be wrapped in ICMP Replay
     let outgoing = thread::spawn(move || {
         let client_addr = loop {
-            match *i_client_addr.read().expect("RAW_SR: Lock poisoned") {
+            match *i_client_addr
+                .read()
+                .expect("[SERVER_OUTGOING] Lock poisoned")
+            {
                 Some(addr) => break addr,
                 None => {
-                    debug!("Waiting for first client packet to arrive");
+                    debug!("[SERVER_OUTGOING] Waiting for first client packet to arrive");
                     thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -126,9 +144,9 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
             match tun_receiver.next() {
                 Ok(packet_data) => {
                     debug!(
-                        "[{}] recieved packet of len from tunnel {}",
+                        "[SERVER_OUTGOING] received packet of len {} from tunnel {}",
+                        packet_data.len(),
                         &i_tun_iface_name,
-                        packet_data.len()
                     );
 
                     let mut outgoing_buffer = vec![0; packet_data.len() + 64];
@@ -146,19 +164,29 @@ pub fn server_main(tunnel_iface_name: &str, real_iface_name: &str) -> Result<(),
                     trace!("[SERVER_OUTGOING] Sending packet {:#?}", &icmp_reply);
 
                     debug!(
-                        "[{}] Sending ICMP packet to client {} - data len {}",
-                        &i_inet_iface_name,
+                        "[SERVER_OUTGOING] Sending ICMP packet to client {} over interface {} - data len {}",
                         &client_addr,
+                        &i_inet_iface_name,
                         packet_data.len()
                     );
 
-                    raw_sender
-                        .send_to(icmp_reply, IpAddr::V4(client_addr))
-                        .expect("Failed to write to inet device!");
+                    match raw_sender.send_to(icmp_reply, IpAddr::V4(client_addr)) {
+                        Ok(bytes_written) => debug!(
+                            "[SERVER_OUTGOING] Written {} bytes to {}",
+                            bytes_written, &i_inet_iface_name
+                        ),
+                        Err(e) => error!(
+                            "[SERVER_OUTGOING] Failed to write to {}!",
+                            &i_inet_iface_name
+                        ),
+                    };
                 }
                 Err(e) => {
                     // If an error occurs, we can handle it here
-                    panic!("An error occurred while reading: {}", e);
+                    error!(
+                        "[SERVER_OUTGOING] An error occurred while reading from {}: {}",
+                        &i_tun_iface_name, e
+                    );
                 }
             }
         }
